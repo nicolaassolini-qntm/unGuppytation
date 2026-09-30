@@ -423,3 +423,81 @@ def test_helper_loses_source_information_rejected():
     # it cannot preserve arbitrary input states and must never be accepted.
     with pytest.raises(RuntimeError, match="basic-block input"):
         clean.compile_function()
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2, 5])
+def test_recursive_runtime_depth(depth, validate, run_int_fn, tmp_path):
+    @guppy(unitary=True)
+    def use_cx(a: qubit, b: qubit) -> None:
+        x(a)
+        cx(a, b)
+
+    @guppy
+    def recursive_use_cx(a: qubit, b: qubit, depth: int) -> None:
+        if depth > 0:
+            use_cx(a, b)
+            recursive_use_cx(a, b, depth - 1)
+
+    @guppy
+    def clean_copy(a: qubit, result: qubit, b: bool, depth: int) -> None:
+        temporary = qubit()
+        h(a)
+        recursive_use_cx(a, temporary, depth)
+        cx(temporary, result)
+        forget(temporary)
+
+    @guppy
+    def main(depth: int) -> int:
+        a, result = qubit(), qubit()
+        clean_copy(a, result, False, depth)
+        if depth % 2 == 1:
+            x(a)
+            cx(a, result)
+        if ((depth + 1) // 2) % 2 == 1:
+            x(result)
+        h(a)
+        av, rv = measure(a), measure(result)
+        return int(bool(av)) + int(bool(rv))
+
+    program = clean_copy.compile_function()
+    validate(program)
+    module = program.modules[0]
+    (tmp_path / "recursive.hugr").write_bytes(module.to_bytes())
+    assert "reverse_recursive_use_cx" in module.render_dot().source
+    run_int_fn(main, 0, args=[depth], num_qubits=16)
+
+
+@pytest.mark.parametrize("depth", [0, 1, 4])
+def test_recursive_garbage(depth, validate, run_int_fn):
+    @guppy
+    def iterate(a: qubit, target: qubit, depth: int) -> None:
+        if depth <= 0:
+            cx(a, target)
+        else:
+            tmp = qubit()
+            iterate(a, tmp, depth - 1)
+            x(tmp)
+            cx(tmp, target)
+            forget(tmp)
+
+    @guppy
+    def clean(a: qubit, result: qubit, depth: int) -> None:
+        tmp = qubit()
+        iterate(a, tmp, depth)
+        cx(tmp, result)
+        forget(tmp)
+
+    @guppy
+    def main(depth: int) -> int:
+        a, result = qubit(), qubit()
+        h(a)
+        clean(a, result, depth)
+        cx(a, result)
+        if depth % 2 == 1:
+            x(result)
+        h(a)
+        av, rv = measure(a), measure(result)
+        return int(bool(av)) + int(bool(rv))
+
+    validate(main.compile_function())
+    run_int_fn(main, 0, args=[depth], num_qubits=32)

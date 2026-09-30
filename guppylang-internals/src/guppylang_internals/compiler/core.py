@@ -65,6 +65,7 @@ from guppylang_internals.tys.ty import (
 )
 
 if TYPE_CHECKING:
+    from guppylang_internals.compiler.uncomputation_variants import Variants
     from guppylang_internals.compiler.builder import DFBuilder
     from guppylang_internals.definition.function import CompiledFunctionDef
     from guppylang_internals.tys import Effect
@@ -141,6 +142,7 @@ class CompilerContext(ToHugrContext):
         self.worklist = {}
         self.compiled = {}
         self.global_funcs = {}
+        self.uncomputation_variants: Variants | None = None
         self.exported_defs: set[DefId] = exported_defs
         self.effects = effects
         self.custom_uses_by_unmodified_callee = (

@@ -5,15 +5,14 @@ basis copies have explicit inverses. No changes to Guppy's dagger semantics occu
 """
 
 import ast
-import copy
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from hugr import Wire, ops
 from hugr import tys as ht
 
-from guppylang_internals.ast_util import get_type, get_type_opt, with_loc, with_type
+from guppylang_internals.ast_util import get_type, get_type_opt
 from guppylang_internals.checker.core import Variable
 from guppylang_internals.compiler.builder import pure
 from guppylang_internals.compiler.core import CompilerContext, DFContainer
@@ -28,9 +27,8 @@ from guppylang_internals.compiler.uncomputation import (
     synthesize,
 )
 from guppylang_internals.definition.custom import CustomFunctionDef
-from guppylang_internals.definition.function import CheckedFunctionDef
 from guppylang_internals.definition.value import CompiledCallableDef
-from guppylang_internals.engine import DEF_STORE, ENGINE, MonoDefId
+from guppylang_internals.engine import DEF_STORE
 from guppylang_internals.metadata.common import add_unitary_metadata
 from guppylang_internals.nodes import GlobalCall, PlaceNode
 from guppylang_internals.std._internal.compiler.tket_exts import MODIFIER_EXTENSION
@@ -63,67 +61,16 @@ class Contract:
 
 
 class Contracts:
-    """Conservative, per-compilation summaries; no new public purity type system."""
+    """Fixed-point summaries shared with the recursive variant compiler."""
 
-    def __init__(self) -> None:
-        self.cache: dict[MonoDefId, Contract] = {}
+    def __init__(self, ctx: CompilerContext) -> None:
+        from guppylang_internals.compiler.uncomputation_variants import Variants
+
+        self.variants = Variants.get(ctx)
 
     def get(self, call: GlobalCall) -> Contract:
-        from guppylang.std.quantum import cx, toffoli, x
-
-        primitives = {
-            x.id: Contract(True),
-            cx.id: Contract(True, frozenset({0})),
-            toffoli.id: Contract(True, frozenset({0, 1})),
-        }
-        if call.def_id in primitives:
-            return primitives[call.def_id]
-        key = (call.def_id, call.type_args)
-        if key in self.cache:
-            return self.cache[key]
-        # Recursive/opaque functions default to quantum, never to qfree.
-        self.cache[key] = Contract(False)
-        # Modifier-use analysis has already run. An inserted inverse cannot safely
-        # introduce a previously unregistered custom modifier implementation.
-        if DEF_STORE.custom_modified_defs.get(call.def_id):
-            return self.cache[key]
-        fn = ENGINE.get_checked(*key)
-        if not isinstance(fn, CheckedFunctionDef):
-            return self.cache[key]
-        if not isinstance(fn.ty.output, NoneType):
-            return self.cache[key]
-        cfg = fn.cfg
-        if any(len(bb.successors) > 1 for bb in cfg.bbs) or any(
-            bb is not cfg.exit_bb and bb is not cfg.entry_bb for bb in cfg.bbs
-        ):
-            return self.cache[key]
-        quantum_inputs = {
-            inp.name: i for i, inp in enumerate(fn.ty.inputs) if is_qubit_ty(inp.ty)
-        }
-        conserved = set(quantum_inputs.values())
-        for stmt in cfg.entry_bb.statements:
-            if isinstance(stmt, ast.Return) and stmt.value is None:
-                continue
-            if isinstance(stmt, ast.Pass):
-                continue
-            if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, GlobalCall):
-                return self.cache[key]
-            child = stmt.value
-            contract = self.get(child)
-            if not contract.qfree:
-                return self.cache[key]
-            for i, arg in enumerate(child.args):
-                if contain_qubit_ty(get_type(arg)):
-                    if not isinstance(arg, PlaceNode) or not isinstance(
-                        arg.place, Variable
-                    ):
-                        return self.cache[key]
-                    if arg.place.name not in quantum_inputs:
-                        return self.cache[key]
-                    if i not in contract.conserved:
-                        conserved.discard(quantum_inputs[arg.place.name])
-        self.cache[key] = Contract(True, frozenset(conserved))
-        return self.cache[key]
+        result = self.variants.summary(call)
+        return Contract(result.qfree, result.conserved)
 
 
 @dataclass
@@ -133,6 +80,10 @@ class Call:
     conserved: tuple[int, ...]
     target: ast.expr | None = None
     classical: dict[int, Wire] = field(default_factory=dict)
+    projection: frozenset[int] | None = None
+    residual: bool = False
+    source: "Call | None" = None
+    garbage: Wire | None = None
 
 
 @dataclass
@@ -140,68 +91,68 @@ class Classical:
     stmt: ast.stmt
 
 
-def expand_helper(stmts: Sequence[ast.stmt], call: GlobalCall) -> list[ast.stmt] | None:
-    """Expose one proven-qfree helper when its whole-call contract is too coarse.
+def factor_call(
+    s: Statement, outputs: set[int], contracts: Contracts
+) -> list[Statement] | None:
+    """Factor f into its closed retained-output projection P and P†;f.
 
-    Classical arguments are bound once before substituting the checked body, even
-    if unused or referenced repeatedly. The original checked CFG is never edited.
-    The caller invokes this only for producers accepted by Contracts.get().
+    The residual conserves the retained outputs. This makes the paper's conserved
+    argument boundary explicit without exposing, cloning, or unrolling f's body.
     """
-    fn = ENGINE.get_checked(call.def_id, call.type_args)
-    if not isinstance(fn, CheckedFunctionDef):
+    call = s.payload
+    if not isinstance(call, Call) or call.projection is not None:
         return None
-    index = next(
-        (i for i, s in enumerate(stmts) if isinstance(s, ast.Expr) and s.value is call),
-        None,
+    key = (call.node.def_id, call.node.type_args)
+    if key not in contracts.variants.functions:
+        return None
+    targets = [i for i in call.quantum if i not in call.conserved]
+    kept = frozenset(
+        i for i, r in zip(targets, s.produced, strict=True) if r in outputs
     )
-    if index is None:
+    selected = kept | frozenset(call.conserved)
+    if (
+        not kept
+        or kept == set(targets)
+        or not contracts.variants.can_project(call.node, selected)
+    ):
         return None
-    names = {
-        n.place.name
-        for s in stmts
-        for n in ast.walk(s)
-        if isinstance(n, PlaceNode) and isinstance(n.place, Variable)
-    }
-    arguments: dict[str, ast.expr] = {}
-    prefix: list[ast.stmt] = []
-    for i, (inp, arg) in enumerate(zip(fn.ty.inputs, call.args, strict=True)):
-        assert inp.name is not None
-        if is_qubit_ty(inp.ty):
-            arguments[inp.name] = arg
-        else:
-            name = f"%uncompute_arg_{i}"
-            while name in names:
-                name += "_"
-            names.add(name)
-            var = Variable(name, inp.ty, call)
-            bound = with_loc(call, with_type(inp.ty, PlaceNode(var)))
-            prefix.append(with_loc(call, ast.Assign(targets=[bound], value=arg)))
-            arguments[inp.name] = bound
-
-    class SubstituteParameters(ast.NodeTransformer):
-        def visit_PlaceNode(self, node: PlaceNode) -> ast.expr:
-            if isinstance(node.place, Variable) and node.place.name in arguments:
-                return copy.deepcopy(arguments[node.place.name])
-            return node
-
-    body = [
-        SubstituteParameters().visit(copy.deepcopy(s))
-        for s in fn.cfg.entry_bb.statements
-        if not isinstance(s, ast.Return)
+    before = dict(zip(targets, s.consumed, strict=True))
+    after = dict(zip(targets, s.produced, strict=True))
+    controls = dict(zip(call.conserved, s.conserved, strict=True))
+    prefix = replace(call, quantum=tuple(sorted(selected)), projection=selected)
+    residual = replace(
+        call,
+        conserved=tuple(sorted(selected)),
+        projection=selected,
+        residual=True,
+        source=prefix,
+    )
+    return [
+        Statement(
+            s.op,
+            s.conserved,
+            tuple(before[i] for i in targets if i in kept),
+            tuple(after[i] for i in targets if i in kept),
+            payload=prefix,
+        ),
+        Statement(
+            s.op,
+            tuple(controls[i] if i in controls else after[i] for i in sorted(selected)),
+            tuple(before[i] for i in targets if i not in kept),
+            tuple(after[i] for i in targets if i not in kept),
+            payload=residual,
+        ),
     ]
-    return [*stmts[:index], *prefix, *body, *stmts[index + 1 :]]
 
 
 def compile_uncomputation(
     stmts: Sequence[ast.stmt],
     compiler: "StmtCompiler",
     dfg: DFContainer,
-    *,
-    _expanded_calls: int = 0,
 ) -> DFContainer:
     """Compile a basic block containing a standalone forget request."""
     ctx = compiler.ctx
-    contracts = Contracts()
+    contracts = Contracts(ctx)
     statements: list[Statement] = []
     current: dict[Variable.Id, int] = {}
     places: dict[Variable.Id, Variable] = {}
@@ -337,7 +288,7 @@ def compile_uncomputation(
         ty = fn.ty
         contract = contracts.get(call)
         controlled = UnitaryFlags.Control in ty.unitary_flags
-        if not controlled:
+        if not controlled and not contract.qfree:
             raise UncomputationError(f"{fn.name} is not controllable")
         if not isinstance(ty.output, NoneType) or any(
             InputFlags.Inout not in ty.inputs[i].flags for i in quantum
@@ -359,7 +310,9 @@ def compile_uncomputation(
         statements.append(
             Statement(
                 Operation(
-                    fn.name, contract.qfree, UnitaryFlags.Dagger in ty.unitary_flags
+                    fn.name,
+                    contract.qfree,
+                    contract.qfree or UnitaryFlags.Dagger in ty.unitary_flags,
                 ),
                 tuple(regs[i] for i in conserved),
                 tuple(regs[i] for i in consumed),
@@ -370,29 +323,23 @@ def compile_uncomputation(
         for i, r in zip(consumed, produced, strict=True):
             current[place(call.args[i]).id] = r
 
-    try:
-        plan = synthesize(statements, tuple(inputs), tuple(current.values()))
-    except UncomputationSynthesisError as error:
-        # A mutable helper may hide a conserved intermediate value. For example,
-        # X(a); CX(a, b) computes b from the *updated* a, so cleanup only needs CX.
-        # Try the checked body instead of rejecting every such call at its boundary.
-        # No plan has been emitted at this point, so retrying is transactional.
-        for producer in error.producers:
-            if (
-                producer.op.qfree
-                and producer.op.daggerable
-                and isinstance(producer.payload, Call)
-            ):
-                expanded = expand_helper(stmts, producer.payload.node)
-                if expanded is not None:
-                    if _expanded_calls >= 64:
-                        raise UncomputationError(
-                            "Uncomputation requires more than 64 helper expansions"
-                        ) from error
-                    return compile_uncomputation(
-                        expanded, compiler, dfg, _expanded_calls=_expanded_calls + 1
+    while True:
+        try:
+            plan = synthesize(statements, tuple(inputs), tuple(current.values()))
+            break
+        except UncomputationSynthesisError as error:
+            for producer in error.producers:
+                factored = factor_call(producer, set(current.values()), contracts)
+                if factored is not None:
+                    index = next(
+                        i
+                        for i, s in enumerate(statements)
+                        if s.payload is producer.payload
                     )
-        raise
+                    statements[index : index + 1] = factored
+                    break
+            else:
+                raise
     wires = inputs.copy()
     for s in plan:
         with dfg.builder.set_ast_context(
@@ -457,11 +404,83 @@ def _emit_call(
         zip(targets, s.consumed, strict=True)
     )
     if not s.dagger:
-        call.classical = {
-            i: compiler.expr_compiler.compile(a, dfg)
-            for i, a in enumerate(call.node.args)
-            if i not in call.quantum
-        }
+        call.classical = (
+            call.source.classical
+            if call.source
+            else {
+                i: compiler.expr_compiler.compile(a, dfg)
+                for i, a in enumerate(call.node.args)
+                if not is_qubit_ty(get_type(a))
+            }
+        )
+    from guppylang_internals.compiler.uncomputation_variants import Variants
+
+    variants = Variants.get(ctx)
+    key = (call.node.def_id, call.node.type_args)
+    summary = variants.summary(call.node)
+    if (
+        key in variants.functions
+        and summary.qfree
+        and summary.garbage
+        and s.partner is not None
+    ):
+        from guppylang_internals.compiler.uncomputation_garbage import (
+            GarbageVariants,
+            new_bin,
+            finish_bin,
+        )
+
+        args_by_index = call.classical | {i: wires[r] for i, r in registers.items()}
+        bin = call.garbage if s.dagger else new_bin(dfg.builder)
+        assert bin is not None
+        quantum_results, bin = GarbageVariants.get(variants).emit(
+            call.node, args_by_index, bin, dfg, s.dagger
+        )
+        if s.dagger:
+            finish_bin(dfg.builder, bin)
+        else:
+            call.garbage = bin
+    elif key in variants.functions and summary.qfree and not summary.garbage:
+        args_by_index = call.classical | {i: wires[r] for i, r in registers.items()}
+        if call.residual:
+            assert call.projection is not None
+            stages = (
+                [(None, True), (call.projection, False)]
+                if s.dagger
+                else [(call.projection, True), (None, False)]
+            )
+        else:
+            stages = [(call.projection, s.dagger)]
+        for selected, inverse in stages:
+            indices = sorted(selected) if selected is not None else list(call.quantum)
+            results = variants.emit(
+                call.node, args_by_index, dfg, inverse=inverse, selected=selected
+            )
+            args_by_index.update(zip(indices, results, strict=True))
+        quantum_results = [args_by_index[i] for i in call.quantum]
+    else:
+        quantum_results = _emit_default_dagger(
+            s, call, registers, wires, compiler, dfg, fn
+        )
+    out_regs = dict(zip(call.conserved, s.conserved, strict=True)) | dict(
+        zip(targets, s.produced, strict=True)
+    )
+    for r in s.consumed:
+        wires.pop(r)
+    for i, wire in zip(call.quantum, quantum_results, strict=True):
+        wires[out_regs[i]] = wire
+
+
+def _emit_default_dagger(
+    s: Statement,
+    call: Call,
+    registers: dict[int, int],
+    wires: dict[int, Wire],
+    compiler: "StmtCompiler",
+    dfg: DFContainer,
+    fn: CompiledCallableDef,
+) -> list[Wire]:
+    ctx = compiler.ctx
     args = [
         wires[registers[i]] if i in registers else call.classical[i]
         for i in range(len(call.node.args))
@@ -512,10 +531,4 @@ def _emit_call(
                 (ops.CallIndirect(), fn.call_effects), dagger, *(args[i] for i in order)
             )
         )
-    out_regs = dict(zip(call.conserved, s.conserved, strict=True)) | dict(
-        zip(targets, s.produced, strict=True)
-    )
-    for r in s.consumed:
-        wires.pop(r)
-    for i, wire in zip(call.quantum, quantum_results, strict=True):
-        wires[out_regs[i]] = wire
+    return list(quantum_results)
