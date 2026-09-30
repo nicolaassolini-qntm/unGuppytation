@@ -57,6 +57,13 @@ class StmtCompiler(CompilerBase, AstVisitor[None]):
         contain all variables that are assigned in the given list of statements.
         """
         self.dfg = dfg
+        from guppylang_internals.compiler.uncomputation_compiler import (
+            compile_uncomputation,
+            has_forget,
+        )
+
+        if has_forget(stmts):
+            return compile_uncomputation(stmts, self, dfg)
         for s in stmts:
             self.visit(s)
         return self.dfg
